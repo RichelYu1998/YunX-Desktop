@@ -10,14 +10,14 @@
 视频：哔哩哔哩 / 小红书 / 抖音 / 微博 / 快手 / AcFun / Pixiv；另支持磁力 / BT 种子 / ed2k 等 P2P 链接。
 Range 分片并发 + 断点续传，B 站高清自动合轨。
 
-[![Release](https://img.shields.io/github/v/release/tidain/YunX-Desktop?style=flat-square\&label=release\&color=4C8BF5)](https://github.com/tidain/YunX-Desktop/releases/latest)
-[![Stars](https://img.shields.io/github/stars/tidain/YunX-Desktop?style=flat-square\&logo=github\&color=4C8BF5)](https://github.com/tidain/YunX-Desktop/stargazers)
+[![Release](https://img.shields.io/github/v/release/RichelYu1998/YunX-Desktop?style=flat-square\&label=release\&color=4C8BF5)](https://github.com/RichelYu1998/YunX-Desktop/releases/latest)
+[![Stars](https://img.shields.io/github/stars/RichelYu1998/YunX-Desktop?style=flat-square\&logo=github\&color=4C8BF5)](https://github.com/RichelYu1998/YunX-Desktop/stargazers)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue?style=flat-square)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows-0078D6?style=flat-square\&logo=windows\&logoColor=white)](#构建)
 [![Kotlin](https://img.shields.io/badge/Kotlin-7F52FF?style=flat-square\&logo=kotlin\&logoColor=white)](https://kotlinlang.org/)
 [![Compose](https://img.shields.io/badge/Compose%20Multiplatform-Desktop-4285F4?style=flat-square\&logo=jetpackcompose\&logoColor=white)](https://www.jetbrains.com/lp/compose-multiplatform/)
 
-[下载最新版](https://github.com/tidain/YunX-Desktop/releases/latest) · [功能](docs/FEATURES.md) · [使用](docs/USAGE.md) · [浏览器插件](#浏览器插件) · [构建](docs/BUILD.md) · [常见问题](#常见问题) · [与安卓版差异](docs/UPSTREAM-DIFF.md)
+[下载最新版](https://github.com/RichelYu1998/YunX-Desktop/releases/latest) · [功能](docs/FEATURES.md) · [使用](docs/USAGE.md) · [浏览器插件](#浏览器插件) · [构建](docs/BUILD.md) · [常见问题](#常见问题) · [与安卓版差异](docs/UPSTREAM-DIFF.md)
 
 </div>
 
@@ -102,7 +102,7 @@ Range 分片并发 + 断点续传，B 站高清自动合轨。
 
 - **通知中心进度** —— 下载进度实时显示为 Windows 通知中心 toast 进度条（多任务聚合 + 实时速度）
 
-- **多种登录方式** —— 内嵌 Chromium 登录 / 一键导入本机浏览器 Cookie / 手动粘贴 Cookie；GitHub 可选 Personal Access Token
+- **多种登录方式** —— 内嵌 Chromium 登录（扫码 / 账号密码 / 短信验证都由官网页面自己完成，登录成功即**自动采集 Cookie 并保存**，解析与下载自动携带，无需手动点保存）/ 一键导入本机浏览器 Cookie / 手动粘贴 Cookie；登录态校验失败会自动重试，仍失败才提示重新登录；GitHub 可选 Personal Access Token
 
 - **Windows 系统集成** —— 原生托盘菜单（亮暗跟随系统配色）、原生文件对话框、剪贴板分享链接检测
 
@@ -115,6 +115,23 @@ Range 分片并发 + 断点续传，B 站高清自动合轨。
 - **引擎管理** —— 下载引擎（Gopeed 内核）与视频预览引擎（FFmpeg 精简版）集中管理，可下载 / 更新 / 卸载并查看路径与来源
 
 完整功能清单见 **[功能清单](docs/FEATURES.md)**。
+
+## 最近更新（v1.3.3 维护修复）
+
+- **内嵌浏览器可用性** —— 修复 macOS / Linux 上内嵌 Chromium 起不来（JDK 17 起 `sun.awt` / `sun.lwawt` 不再默认导出、
+  缺少 `libjawt`）的问题：启动参数补 `--add-exports` / `--add-opens`，初始化前按 `java.home` 显式预载 jawt；
+  初始化失败时登录页给出**具体原因 + 重试**，而不是笼统的「不可用」
+- **登录态自动采集** —— 登录页改为**观察浏览器就绪状态**（不再取一次性快照），CEF 后台就绪后自动重建浏览器；
+  每 1.5 秒轮询 Cookie，命中登录态即自动保存并自动携带，保存失败与凭证无效分开提示，失败 10 秒后自动重试
+- **百度网盘 errno=-6** —— Cookie 域名改为**按域后缀匹配**（原来子串匹配漏掉 `pan.baidu.com` 下发的 `PANWEB=1`），
+  保存 / 请求前统一补齐 `PANWEB=1`；`bdstoken` 拉取失败时**回退解析网盘首页 HTML**，老 Cookie 不必重新登录
+- **迅雷短信验证码登录** —— 验证码绑定触发风控那一步的 `creditkey` / `token` 上下文，空 token 不再下发；
+  失败原因细化为「验证码错误 / 已过期 / 换 token 失败」，可在应用内打开验证面板兜底
+- **跨平台密钥** —— 机器指纹不再只读 Windows 注册表：macOS 取 `IOPlatformUUID`、Linux 取 `/etc/machine-id`，
+  修复非 Windows 环境保存 Cookie 失败
+- **构建** —— Gradle 发行包走腾讯云镜像；仓库地址统一为 `RichelYu1998/YunX-Desktop`
+
+开发规范、登录态采集约定与版本记录见 **[skill.md](skill.md)**（Word 版：[skill.docx](skill.docx)）。
 
 ## 与安卓版的差异
 
@@ -150,7 +167,7 @@ Range 分片并发 + 断点续传，B 站高清自动合轨。
 `installer` 会在这一步失败）。JDK、Gradle、Inno Setup 均无需手动安装。
 
 ```powershell
-git clone https://github.com/tidain/YunX-Desktop.git
+git clone https://github.com/RichelYu1998/YunX-Desktop.git
 cd YunX-Desktop
 
 .\run.ps1 run        # 编译并启动（开发，含 darkmode.dll）
@@ -161,6 +178,10 @@ cd YunX-Desktop
 
 环境要求、版本号管理与打包产物见 **[构建与打包](docs/BUILD.md)**。
 
+> **macOS / Linux 开发调试**：根目录 `start.sh` 一套脚本通吃（Windows 上由 `start.bat` / `run.ps1` 转调）。
+> `./start.sh run` 编译并启动，`./start.sh build` 只编译；`--no-jcef` 关闭内嵌浏览器（登录自动回退粘贴模式），
+> `--jcef` 在 Linux 上强制启用内嵌浏览器。**版本号只认 `version.txt`，启动脚本里不写版本号**（见 [skill.md](skill.md)）。
+
 ## 常见问题
 
 <details>
@@ -170,6 +191,15 @@ cd YunX-Desktop
 **2026 年 10 月 2 日上午 8:40**，桌面版作者（tidain）加入安卓版仓库成为协作者，
 桌面版自此与安卓版同属一个项目，作为云析的**官方 Windows 桌面端**维护；
 两端的代码、发布节奏与分发方式仍各自独立。
+
+</details>
+
+<details>
+<summary><b>百度网盘提示「获取 bdstoken 失败，请重新登录」（errno=-6）？</b></summary>
+
+errno=-6 是网盘接口认为**未登录**的统一报错。除账号被风控外，常见原因是 Cookie 里缺 `PANWEB=1`
+（由 `pan.baidu.com` 下发，采集不全或旧版本保存的 Cookie 都可能没有它）。现在保存与每次请求前都会自动补齐该 Cookie，
+并在 `bdstoken` 拉不到时回退解析网盘首页 HTML；**先升级到最新版再试**，仍然报错才需要退出账号重新登录。
 
 </details>
 
@@ -199,7 +229,7 @@ cd YunX-Desktop
 
 ## 支持开发
 
-- **GitHub Star**：给 [tidain/YunX-Desktop](https://github.com/tidain/YunX-Desktop) 点个 Star ⭐
+- **GitHub Star**：给 [RichelYu1998/YunX-Desktop](https://github.com/RichelYu1998/YunX-Desktop) 点个 Star ⭐
 
 - **提交 Issues**：发现 Bug 或有功能建议欢迎反馈
 
@@ -209,6 +239,7 @@ cd YunX-Desktop
 
 | 文档                              | 内容                             |
 | ------------------------------- | ------------------------------ |
+| [skill.md](skill.md)            | 开发规范、登录态采集约定、版本记录（[Word 版](skill.docx)） |
 | [功能清单](docs/FEATURES.md)        | 全部功能与细节                        |
 | [使用说明](docs/USAGE.md)           | 快速上手、登录方式、设置项、数据目录、托盘操作        |
 | [构建与打包](docs/BUILD.md)          | 环境要求、命令、版本号、打包产物、目录结构          |
@@ -225,9 +256,9 @@ cd YunX-Desktop
 
 - 安卓版仓库：<https://github.com/CYQawa/YunX>
 
-- PC 版仓库：<https://github.com/tidain/YunX-Desktop>
+- PC 版仓库：<https://github.com/RichelYu1998/YunX-Desktop>
 
-- 问题与建议：<https://github.com/tidain/YunX-Desktop/issues>
+- 问题与建议：<https://github.com/RichelYu1998/YunX-Desktop/issues>
 
 ## 友情链接
 - 云析的Docker社区移植版（基于本仓库修改，作为本仓库的下游分支）：[mu-zi-lee/YunX-Docker](https://github.com/mu-zi-lee/YunX-Docker)
@@ -236,16 +267,16 @@ cd YunX-Desktop
 
 <sub><sup>Contributors</sup></sub>
 
-<a href="https://github.com/tidain/YunX-Desktop/graphs/contributors">
-  <img alt="contributors" src="https://contrib.rocks/image?repo=tidain/YunX-Desktop" />
+<a href="https://github.com/RichelYu1998/YunX-Desktop/graphs/contributors">
+  <img alt="contributors" src="https://contrib.rocks/image?repo=RichelYu1998/YunX-Desktop" />
 </a>
 
 ## Star History
 
-<a href="https://www.star-history.com/?repos=tidain%2Fyunx-desktop&type=date&legend=top-left">
+<a href="https://www.star-history.com/?repos=RichelYu1998%2Fyunx-desktop&type=date&legend=top-left">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=tidain/yunx-desktop&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=tidain/yunx-desktop&type=date&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=tidain/yunx-desktop&type=date&legend=top-left" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=RichelYu1998/yunx-desktop&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=RichelYu1998/yunx-desktop&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=RichelYu1998/yunx-desktop&type=date&legend=top-left" />
  </picture>
 </a>
