@@ -41,12 +41,14 @@ class BaiduAccountRepository(
     suspend fun saveBaiduAccount(cookie: String, newAccount: Boolean = false): Boolean {
         if (!BaiduConstants.isValidCookie(cookie)) return false
         api.clearSessionCache()
-        val nickname = api.fetchNickname(cookie) ?: "百度用户"
+        // 落库前补齐 PANWEB 等网盘网页版必备 Cookie，避免保存下来就是「半残」登录态
+        val normalized = BaiduConstants.normalizeCookie(cookie)
+        val nickname = api.fetchNickname(normalized) ?: "百度用户"
         val slot = resolveAccountSlot(DownloadPlatform.BAIDU, dao.getAccount(), newAccount)
         dao.upsert(
             BaiduAccountEntity(
                 id = slot.id,
-                cookie = cookie,
+                cookie = normalized,
                 nickname = nickname,
                 isPrimary = slot.isPrimary,
                 remark = slot.remark

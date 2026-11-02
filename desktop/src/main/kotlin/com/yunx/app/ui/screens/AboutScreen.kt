@@ -598,7 +598,7 @@ private fun GitHubCard() {
 private fun DesktopRepoCard() {
     Card(
         onClick = {
-            DesktopActions.openUrl("https://github.com/tidain/YunX-Desktop")
+            DesktopActions.openUrl("https://github.com/RichelYu1998/YunX-Desktop")
         },
         modifier = Modifier.fillMaxWidth(),
         shape = MaterialTheme.shapes.large,
@@ -634,7 +634,7 @@ private fun DesktopRepoCard() {
                     fontWeight = FontWeight.Medium
                 )
                 Text(
-                    text = "github.com/tidain/YunX-Desktop",
+                    text = "github.com/RichelYu1998/YunX-Desktop",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )

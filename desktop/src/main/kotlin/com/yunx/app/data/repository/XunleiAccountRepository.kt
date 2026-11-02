@@ -17,6 +17,19 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
 /**
+ * 短信验证码登录结果。
+ *
+ * - [saved] = true：已换到 token 并落库；
+ * - [saved] = false：[message] 是可直接展示的失败原因，[reviewUrl] 非空时登录页可提供
+ *   「应用内验证」兜底（服务端仍要求走验证面板）。
+ */
+data class XunleiSmsLoginResult(
+    val saved: Boolean,
+    val message: String = "",
+    val reviewUrl: String = ""
+)
+
+/**
  * 迅雷账号仓库：账号+密码登录（可能触发短信验证）→ 换 token 落库。
  */
 class XunleiAccountRepository(
@@ -56,26 +69,47 @@ class XunleiAccountRepository(
         return api.loginWithPassword(username, password, deviceId)
     }
 
-    /** 发送短信验证码（登录触发 review_panel 后调用） */
-    suspend fun sendSms(mobile: String): XunleiLoginStep {
+    /** 发送短信验证码（登录触发 review_panel 后调用）
+     *
+     * ★ creditKey/smsToken 传「当前验证上下文」的值：密码登录触发风控时，验证码是绑在
+     *   reviewurl 里的 creditkey 上的；这里重新起一个空 creditkey 的上下文会让后面提交的
+     *   验证码对不上（表现为「验证码校验失败」）。
+     */
+    suspend fun sendSms(
+        mobile: String,
+        creditKey: String = "",
+        smsToken: String = ""
+    ): XunleiLoginStep {
         val deviceId = XunleiApi.newDeviceId()
-        return api.sendSms(mobile, deviceId)
+        return api.sendSms(mobile, deviceId, creditKey, smsToken)
     }
 
-    /** 短信验证码登录并换取 token，成功落库返回 true */
+    /**
+     * 短信验证码登录并换取 token。
+     *
+     * 返回失败原因（而不是裸 false）：登录页要能区分「验证码错误 / 已过期 / 换 token 失败」，
+     * 一律提示「验证码校验失败」会让用户完全无从下手。
+     */
     suspend fun loginWithSms(
         mobile: String,
         smsCode: String,
         creditKey: String,
         smsToken: String,
         newAccount: Boolean = false
-    ): Boolean {
+    ): XunleiSmsLoginResult {
         val deviceId = XunleiApi.newDeviceId()
         val step = api.smsLogin(mobile, smsCode, creditKey, smsToken, deviceId)
-        if (step.sessionId.isBlank()) return false
+        if (step.sessionId.isBlank()) {
+            return XunleiSmsLoginResult(
+                saved = false,
+                message = describeSmsFailure(step),
+                reviewUrl = step.reviewUrl
+            )
+        }
         // 换 token 前先 initCaptcha 拿 captcha_token（官方时序：smslogin → captcha/init → signin/token）
         val captchaToken = api.initCaptcha(deviceId, mobile) ?: ""
-        val tokens = api.exchangeToken(step.sessionId, deviceId, captchaToken) ?: return false
+        val tokens = api.exchangeToken(step.sessionId, deviceId, captchaToken)
+            ?: return XunleiSmsLoginResult(false, "验证码已通过，但换取登录凭证失败，请重试")
         val slot = resolveAccountSlot(DownloadPlatform.XUNLEI, dao.getAccount(), newAccount)
         dao.upsert(
             XunleiAccountEntity(
@@ -89,7 +123,24 @@ class XunleiAccountRepository(
                 remark = slot.remark
             )
         )
-        return true
+        return XunleiSmsLoginResult(saved = true)
+    }
+
+    /** 把 smslogin 的失败响应翻成用户能看懂的一句话（保留服务端原文，便于排查） */
+    private fun describeSmsFailure(step: XunleiLoginStep): String {
+        val code = step.errorCode
+        val raw = step.message
+        val hint = when {
+            code.contains("creditkey", ignoreCase = true) ||
+                raw.contains("creditkey", ignoreCase = true) -> "验证码上下文已过期，请重新发送验证码"
+            code.contains("expire", ignoreCase = true) ||
+                raw.contains("过期", ignoreCase = true) ||
+                raw.contains("expire", ignoreCase = true) -> "验证码已过期，请重新发送验证码"
+            raw.contains("验证码", ignoreCase = true) -> raw
+            raw.isBlank() -> "验证码校验失败，请确认验证码未过期后重试"
+            else -> raw
+        }
+        return if (code.isBlank() || code == "0") hint else "$hint（$code）"
     }
 
     /** 密码登录成功后用 sessionID 换 token 落库 */

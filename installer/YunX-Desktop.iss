@@ -18,9 +18,9 @@ AppId={{7C1E5F9A-3B2D-4E68-9C4F-A1D2B3C4E5F6}
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppPublisher={#AppNameEn}
-AppPublisherURL=https://github.com/tidain/YunX-Desktop
-AppSupportURL=https://github.com/tidain/YunX-Desktop/issues
-AppUpdatesURL=https://github.com/tidain/YunX-Desktop/releases
+AppPublisherURL=https://github.com/RichelYu1998/YunX-Desktop
+AppSupportURL=https://github.com/RichelYu1998/YunX-Desktop/issues
+AppUpdatesURL=https://github.com/RichelYu1998/YunX-Desktop/releases
 ; 安装程序自身的文件版本信息（资源管理器 → setup.exe 属性 → 详细信息）
 VersionInfoVersion={#AppVersion}
 VersionInfoProductName={#AppName}

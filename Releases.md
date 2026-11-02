@@ -3,7 +3,7 @@
 # 云析桌面版 v1.3.3
 
 > 发布日期：2026-10-31
-> 安卓版：CYQawa/YunX ｜ 桌面版：tidain/YunX-Desktop
+> 安卓版：CYQawa/YunX ｜ 桌面版：RichelYu1998/YunX-Desktop
 
 ## 新增：P2P 下载（磁力 / BT 种子 / ed2k）
 
@@ -45,7 +45,7 @@
 
 ## 下载
 
-<https://github.com/tidain/YunX-Desktop/releases>
+<https://github.com/RichelYu1998/YunX-Desktop/releases>
 
 - **便携版**：解压即用
 
@@ -55,7 +55,7 @@
 
 ## 反馈
 
-<https://github.com/tidain/YunX-Desktop/issues>
+<https://github.com/RichelYu1998/YunX-Desktop/issues>
 
 ***
 

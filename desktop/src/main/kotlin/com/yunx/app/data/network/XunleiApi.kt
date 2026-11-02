@@ -39,6 +39,7 @@ data class XunleiLoginStep(
     val nickname: String = "",
     val userID: String = "",
     val reviewUrl: String = "",       // review_panel 返回的验证页 URL（可浏览器兜底）
+    val errorCode: String = "",       // 服务端 errorCode / error（失败时用于区分原因）
     val message: String = ""
 )
 
@@ -173,11 +174,22 @@ class XunleiApi(
         }
     }
 
-    /** 3a. 发送短信验证码（官方：UA=xl-acc-sdk/version-5.0.12.512000，creditkey=""，无 Cookie） */
-    suspend fun sendSms(mobile: String, deviceId: String): XunleiLoginStep = withContext(Dispatchers.IO) {
-        val body = baseLoginBody(deviceId, "8.31.0.9726", "231500")
+    /** 3a. 发送短信验证码（官方：UA=xl-acc-sdk/version-5.0.12.512000，无 Cookie）
+     *
+     * ★ creditKey / token 必须带上「触发风控那一步」的值（review_panel 的 reviewurl 里的
+     *   creditkey/token）：验证码是绑定在这个验证上下文里的，重新起一个空 creditkey 的
+     *   sendsms 会得到另一个上下文，随后 smslogin 提交同一个验证码就会被判「验证码校验失败」。
+     */
+    suspend fun sendSms(
+        mobile: String,
+        deviceId: String,
+        creditKey: String = "",
+        smsToken: String = ""
+    ): XunleiLoginStep = withContext(Dispatchers.IO) {
+        val body = baseLoginBody(deviceId, "8.31.0.9726", "231500", creditKey)
             .put("mobile", mobile)
             .put("register", "0")
+            .apply { if (smsToken.isNotBlank()) put("token", smsToken) }
             .toString()
         val request = Request.Builder()
             .url(XunleiConstants.SEND_SMS_URL)
@@ -189,8 +201,10 @@ class XunleiApi(
             val json = JSONObject(resp.body?.string() ?: "{}")
             XunleiLoginStep(
                 needSms = true,
-                smsCreditKey = json.optString("creditkey"),
-                smsToken = json.optString("token"),
+                // 服务端可能回显同一个 creditkey，也可能换发新的；拿不到就沿用请求里的
+                smsCreditKey = json.optString("creditkey").ifBlank { creditKey },
+                smsToken = json.optString("token").ifBlank { smsToken },
+                errorCode = json.optString("errorCode").ifBlank { json.optString("error") },
                 message = json.optString("errorDesc").ifBlank { "短信已发送" }
             )
         }
@@ -207,8 +221,10 @@ class XunleiApi(
         val body = baseLoginBody(deviceId, "8.31.0.9726", "231500", creditKey)
             .put("mobile", mobile)
             .put("smsCode", smsCode)
-            .put("token", smsToken)
             .put("register", "0")
+            // ★ token 为空时不要塞空串：服务端会当成「token 不匹配」直接判验证码失败，
+            //   而空 token 场景（sendsms 没回 token）本应走「只凭 creditkey 校验」的分支。
+            .apply { if (smsToken.isNotBlank()) put("token", smsToken) }
             .toString()
         val request = Request.Builder()
             .url(XunleiConstants.SMS_LOGIN_URL)
@@ -397,6 +413,7 @@ class XunleiApi(
         return XunleiLoginStep(
             needSms = needSms,
             reviewUrl = json.optString("reviewurl"), // 短信发不出时可让用户浏览器完成验证（alist 方式）
+            errorCode = errorCode.ifBlank { error },
             message = json.optString("errorDesc").ifBlank { json.optString("error_description") }
         )
     }

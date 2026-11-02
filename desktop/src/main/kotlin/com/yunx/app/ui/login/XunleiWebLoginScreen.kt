@@ -270,7 +270,22 @@ fun XunleiWebLoginScreen(
                     )
                 } else {
                     Box(modifier = Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
-                        Text("内嵌浏览器不可用，请使用下方「手动粘贴登录凭据」", style = MaterialTheme.typography.bodyLarge)
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            Text(
+                                text = JcefHolder.unavailableReason()
+                                    ?: "内嵌浏览器不可用，请使用下方「手动粘贴登录凭据」",
+                                style = MaterialTheme.typography.bodyLarge,
+                                textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                            )
+                            if (JcefHolder.disabledReason == null) {
+                                OutlinedButton(onClick = { JcefHolder.initInBackground() }) {
+                                    Text("重试加载内嵌浏览器")
+                                }
+                            }
+                        }
                     }
                 }
             }

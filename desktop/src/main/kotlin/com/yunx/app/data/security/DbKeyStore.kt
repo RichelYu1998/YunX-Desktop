@@ -34,8 +34,17 @@ enum class DbEncryptionLevel(val id: String, val label: String) {
     STRICT("strict", "较为严格"),
     STRICTEST("strictest", "严格");
 
-    /** 该档位在当前系统上是否可用（严格档需要 SQLCipher 原生库，暂未支持） */
-    val isSupported: Boolean get() = this != STRICTEST
+    /**
+     * 该档位在当前系统上是否可用：
+     * - [STRICTEST] 需要 SQLCipher 原生库，暂未实现；
+     * - [STRICT] 用 Windows DPAPI，只有 Windows 可用（macOS / Linux 上选它会直接抛异常）。
+     */
+    val isSupported: Boolean
+        get() = when (this) {
+            STRICTEST -> false
+            STRICT -> System.getProperty("os.name").orEmpty().lowercase().contains("win")
+            else -> true
+        }
 
     /** 密钥是否绑定本机（换机器后凭证将无法解密，需重新登录） */
     val isMachineBound: Boolean get() = this == NORMAL || this == STRICT
@@ -212,17 +221,68 @@ object DbKeyStore {
         append(System.getProperty("os.arch").orEmpty()).append('|')
         append(
             machineGuid() ?: throw MachineFingerprintUnavailable(
-                "暂时读不到 MachineGuid，本次不做密钥解包（下次会重试）"
+                "暂时读不到本机唯一标识（Windows MachineGuid / macOS IOPlatformUUID / Linux machine-id），" +
+                    "本次不做密钥解包（下次会重试）"
             )
         )
     }
 
-    /** Windows MachineGuid（HKLM\SOFTWARE\Microsoft\Cryptography），普通用户可读 */
-    private fun machineGuid(): String? = runCatching {
+    /**
+     * 机器唯一标识（跨平台）：
+     * - Windows：注册表 `HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid`（普通用户可读）；
+     * - macOS：`IOPlatformUUID`（ioreg，硬件 UUID，重装系统/换网卡都不变）；
+     * - Linux：`/etc/machine-id`（systemd 标准位置，无 root 可读）。
+     *
+     * ★ 三者都是「开机即稳定、与用户名/计算机名无关」的硬件或系统级标识，符合本类
+     *   「不掺用户名/计算机名」的取舍。结果在内存里缓存：ioreg 是外部进程，每次派生密钥
+     *   都调一次会拖慢登录保存。
+     */
+    @Volatile private var cachedMachineId: String? = null
+
+    private fun machineGuid(): String? {
+        cachedMachineId?.let { return it }
+        val id = when {
+            isWindows() -> windowsMachineGuid()
+            isMac() -> macPlatformUuid()
+            else -> linuxMachineId()
+        }?.takeIf { it.isNotBlank() }
+        if (id != null) cachedMachineId = id
+        return id
+    }
+
+    /** Windows MachineGuid（HKLM\SOFTWARE\Microsoft\Cryptography） */
+    private fun windowsMachineGuid(): String? = runCatching {
         Advapi32Util.registryGetStringValue(
             WinReg.HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Cryptography", "MachineGuid"
-        ).takeIf { it.isNotBlank() }
+        )
     }.getOrNull()
+
+    /**
+     * macOS IOPlatformUUID：`ioreg -rd1 -c IOPlatformExpertDevice` 输出的
+     * `"IOPlatformUUID" = "XXXXXXXX-XXXX-..."` 一行。ioreg 是系统自带工具，无需权限。
+     */
+    private fun macPlatformUuid(): String? = runCatching {
+        val proc = ProcessBuilder("ioreg", "-rd1", "-c", "IOPlatformExpertDevice")
+            .redirectErrorStream(true)
+            .start()
+        val out = proc.inputStream.bufferedReader().use { it.readText() }
+        proc.waitFor()
+        Regex("\"IOPlatformUUID\"\\s*=\\s*\"([^\"]+)\"").find(out)?.groupValues?.get(1)
+    }.getOrNull()
+
+    /** Linux /etc/machine-id（部分发行版在 /var/lib/dbus/machine-id） */
+    private fun linuxMachineId(): String? = runCatching {
+        listOf("/etc/machine-id", "/var/lib/dbus/machine-id")
+            .asSequence()
+            .map { File(it) }
+            .firstOrNull { it.isFile }
+            ?.readText()
+            ?.trim()
+            ?.takeIf { it.isNotBlank() }
+    }.getOrNull()
+
+    private fun isMac(): Boolean =
+        System.getProperty("os.name").orEmpty().lowercase().contains("mac")
 
     /** 较为严格档：Windows DPAPI（CryptProtectData，绑定当前登录用户） */
     private fun wrapDpapi(key: ByteArray): String {

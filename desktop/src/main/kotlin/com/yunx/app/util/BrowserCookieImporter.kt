@@ -33,13 +33,20 @@ object BrowserCookieImporter {
         val count: Int
     )
 
-    /** 平台 → 需要匹配的 Cookie 域名后缀 */
+    /**
+     * 平台 → 需要匹配的 Cookie 域名后缀。
+     *
+     * ★ 这里会拼成 SQL 的 `LIKE '%后缀%'`，所以**不能带前导点**：
+     *   带点写成 `%.baidu.com%` 时，`pan.baidu.com` 这种「平台自己域」的 Cookie
+     *   （百度网盘必备的 PANWEB、夸克的 pan.quark.cn 等）一个都匹配不到，
+     *   导入出来的 Cookie 看着有 BDUSS，接口却一律判未登录。
+     */
     fun domainSuffixes(platform: String): List<String> = when (platform) {
-        "QUARK" -> listOf(".quark.cn")
-        "UC" -> listOf(".uc.cn")
-        "BAIDU" -> listOf(".baidu.com")
-        "C139" -> listOf("mail.10086.cn", "yun.139.com", ".10086.cn")
-        "PAN115" -> listOf(".115.com", ".115cdn.com")
+        "QUARK" -> listOf("quark.cn")
+        "UC" -> listOf("uc.cn")
+        "BAIDU" -> listOf("baidu.com")
+        "C139" -> listOf("10086.cn", "139.com")
+        "PAN115" -> listOf("115.com", "115cdn.com")
         else -> emptyList()
     }
 

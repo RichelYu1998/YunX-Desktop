@@ -353,7 +353,7 @@ private fun FactChip(text: String) {
 private fun GitHubCard() {
     Card(
         onClick = {
-            DesktopActions.openUrl("https://github.com/tidain/YunX-Desktop")
+            DesktopActions.openUrl("https://github.com/RichelYu1998/YunX-Desktop")
         },
         modifier = Modifier.fillMaxWidth(),
         shape = MaterialTheme.shapes.large,
@@ -388,7 +388,7 @@ private fun GitHubCard() {
                     color = MaterialTheme.colorScheme.onSurface
                 )
                 Text(
-                    text = "github.com/tidain/YunX-Desktop",
+                    text = "github.com/RichelYu1998/YunX-Desktop",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -640,7 +640,7 @@ private fun TermsPage() {
             icon = Icons.Outlined.Code,
             title = "开源协议",
             paragraphs = listOf(
-                "本项目基于 GNU AGPL-3.0 协议开源，源码公开于 github.com/tidain/YunX-Desktop。"
+                "本项目基于 GNU AGPL-3.0 协议开源，源码公开于 github.com/RichelYu1998/YunX-Desktop。"
             )
         )
 

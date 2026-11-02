@@ -6,6 +6,23 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
+// ---- 宿主平台判定（决定选哪份原生库依赖）----
+// 发布目标只有 Windows：Windows 上继续用裁剪后的本地 jar / :win classifier（体积小）。
+// macOS / Linux 只用于开发运行，必须换成带对应平台原生库的依赖，否则启动即 UnsatisfiedLinkError
+// （典型症状：org.sqlite.core.NativeDB._open_utf8 / JavaFX 视频预览）。
+val hostOsName = System.getProperty("os.name", "").lowercase()
+val hostArch = System.getProperty("os.arch", "").lowercase()
+val isWindowsHost = hostOsName.contains("win")
+val isMacHost = hostOsName.contains("mac")
+val isArmHost = hostArch == "aarch64" || hostArch == "arm64"
+
+// JavaFX 原生包 classifier：17.0.13 提供 win / mac / mac-aarch64 / linux / linux-aarch64
+val javafxClassifier = when {
+    isWindowsHost -> "win"
+    isMacHost -> if (isArmHost) "mac-aarch64" else "mac"
+    else -> if (isArmHost) "linux-aarch64" else "linux"
+}
+
 dependencies {
     implementation(compose.desktop.currentOs)
     implementation(compose.material3)
@@ -26,21 +43,29 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-swing:1.9.0")
 
     // Room -> 纯 JDBC SQLite
-    // ★ 用裁剪后的本地 jar：官方包 13.6 MB，含六个平台的原生库，本项目只跑 Windows。
+    // ★ Windows（发布目标）用裁剪后的本地 jar：官方包 13.6 MB，含六个平台的原生库，
     //   只保留 org/sqlite/native/Windows（x86/x86_64/arm/arm64），其余代码与 META-INF 原样保留。
-    implementation(files("libs/sqlite-jdbc-3.47.1.0-win.jar"))
+    // ★ 非 Windows 宿主必须用官方包：裁剪包只带 Windows 的 sqlitejdbc.dll，
+    //   在 macOS / Linux 上打开数据库会抛 UnsatisfiedLinkError（NativeDB._open_utf8）。
+    if (isWindowsHost) {
+        implementation(files("libs/sqlite-jdbc-3.47.1.0-win.jar"))
+    } else {
+        implementation("org.xerial:sqlite-jdbc:3.47.1.0")
+    }
     // Android 内置 org.json 的 JVM 等价物
     implementation("org.json:json:20240303")
     // 主题种子色（material-color-utilities 无公开仓库坐标；从 material 1.14.0 AAR 解包 classes.jar 本地引入）
     implementation(files("libs/material-color-utilities-1.0.0.jar"))
 
     // JavaFX MediaView 播放器（M6）：JFXPanel 经 SwingPanel 嵌入 Compose。
-    // 版本跟随 jvmToolchain(17)；发布目标只有 Windows，直接用 :win classifier（jar 内含原生库，
-    // 首次运行由 JavaFX 自动解到用户目录缓存，jpackage 无需额外处理）
-    implementation("org.openjfx:javafx-base:17.0.13:win")
-    implementation("org.openjfx:javafx-graphics:17.0.13:win")
-    implementation("org.openjfx:javafx-media:17.0.13:win")
-    implementation("org.openjfx:javafx-swing:17.0.13:win")
+    // 版本跟随 jvmToolchain(17)；发布目标只有 Windows，打包时用 :win classifier（jar 内含原生库，
+    // 首次运行由 JavaFX 自动解到用户目录缓存，jpackage 无需额外处理）。
+    // ★ 开发运行在 macOS / Linux 时必须换成对应平台的 classifier，
+    //   否则打开视频预览会抛 UnsatisfiedLinkError（找不到 libglass / libprism 等原生库）。
+    implementation("org.openjfx:javafx-base:17.0.13:$javafxClassifier")
+    implementation("org.openjfx:javafx-graphics:17.0.13:$javafxClassifier")
+    implementation("org.openjfx:javafx-media:17.0.13:$javafxClassifier")
+    implementation("org.openjfx:javafx-swing:17.0.13:$javafxClassifier")
 
     // GFM Markdown 渲染（README / 更新说明）。注意：必须停留在 0.33.x ——
     // 0.34.0 起改用 Compose 1.8+ 的 BasicText 签名（含 TextAutoSize），与项目锁定的
@@ -71,7 +96,19 @@ dependencies {
     //   发布包不随带这个 120MB 的 jar，改由打包脚本用 JcefNativesPacker 重打成
     //   app\jcef-natives.tar.gz（裁剪语言包），首次使用时由 JcefNativesInstaller 解开。
     //   见 portable-package.ps1 [2c/5] 与 ui/jcef/JcefNativesInstaller.kt。
-    implementation("me.friwi:jcef-natives-windows-amd64:jcef-1770317+cef-132.3.1+g144febe+chromium-132.0.6834.83")
+    // ★ 按宿主平台引入对应原生库：Windows 是发布目标，macOS / Linux 用于开发运行。
+    //   之前只引 Windows 包，导致 macOS / Linux 上内嵌浏览器永远不可用（登录只能粘贴 Cookie，
+    //   官网登录页自带的扫码 / 短信 / 账号密码等「多方式登录」也就全用不上）。
+    // ★ tag 必须与 jcefmaven 版本对应的同一个 jcef 构建（jcef-1770317+cef-132.3.1...），
+    //   否则 Java API 与原生库版本错配，CefApp 初始化会失败。
+    val jcefNativesTag = "jcef-1770317+cef-132.3.1+g144febe+chromium-132.0.6834.83"
+    when {
+        isWindowsHost -> implementation("me.friwi:jcef-natives-windows-amd64:$jcefNativesTag")
+        isMacHost && isArmHost -> implementation("me.friwi:jcef-natives-macosx-arm64:$jcefNativesTag")
+        isMacHost -> implementation("me.friwi:jcef-natives-macosx-amd64:$jcefNativesTag")
+        isArmHost -> implementation("me.friwi:jcef-natives-linux-arm64:$jcefNativesTag")
+        else -> implementation("me.friwi:jcef-natives-linux-amd64:$jcefNativesTag")
+    }
 
     // tar.gz 读写：CEF 原生库发布包（打包期重打成 gzip，运行期自解包）
     // jcefmaven 已传递引入 commons-compress，这里显式声明版本以保证稳定
@@ -178,6 +215,11 @@ val nativeOutDir = layout.buildDirectory.dir("native").get().asFile
 val darkModeSrc = File(nativeSrcDir, "darkmode.cpp")
 val darkModeOut = File(nativeOutDir, "darkmode.dll")
 
+// darkmode.cpp 依赖 <windows.h> / uxtheme.dll，只在 Windows 上可编译。
+// 非 Windows 宿主（macOS / Linux）自动跳过该任务，避免 g++ 找不到 windows.h 导致构建失败。
+// 应用侧 DarkMode.enable() 内部有 isWindows() 守卫，缺这个 DLL 不影响启动。
+// （isWindowsHost 在文件顶部已声明，供依赖选择复用）
+
 // 定位 MSVC 的 vcvars64.bat（cl 直接调会找不到 windows.h / CRT 库，必须先 call 它）
 fun findMsvcVcvars(): File? {
     val roots = listOf(
@@ -202,6 +244,8 @@ val compileDarkMode by tasks.registering(Exec::class) {
     val vcvars = findMsvcVcvars()
     inputs.file(darkModeSrc)
     outputs.file(darkModeOut)
+    // 非 Windows 宿主跳过：darkmode.cpp 需要 windows.h，macOS/Linux 上无对应头文件
+    onlyIf { isWindowsHost }
     doFirst {
         nativeOutDir.mkdirs()
     }
@@ -226,8 +270,34 @@ val compileDarkMode by tasks.registering(Exec::class) {
 // 开发运行（:desktop:run）时把 DLL 目录并入 java.library.path，并保留 JDK bin（jawt 等原生库）
 tasks.withType<JavaExec> {
     dependsOn(compileDarkMode)
-    val jvmBin = File(System.getProperty("java.home"), "bin").absolutePath
-    systemProperty("java.library.path", "${nativeOutDir.absolutePath};$jvmBin")
+    val jvmHome = File(System.getProperty("java.home")).absolutePath
+    val jvmBin = File(jvmHome, "bin").absolutePath
+    // ★ macOS 上 libjawt.dylib 在 <JDK>/lib 而不是 bin；JCEF 初始化会 System.loadLibrary("jawt")，
+    //   少了这个目录会在 macOS 上直接 UnsatisfiedLinkError（内嵌浏览器不可用的另一层原因）。
+    val jvmLib = File(jvmHome, "lib").absolutePath
+    // 用平台分隔符：Windows 为 ';'，macOS/Linux 为 ':'
+    systemProperty(
+        "java.library.path",
+        "${nativeOutDir.absolutePath}${File.pathSeparator}$jvmBin${File.pathSeparator}$jvmLib"
+    )
+    // ★ macOS 上 JCEF 把浏览器画布挂进窗口时会走 org.cef.browser.mac.CefBrowserWindowMac，
+    //   它直接使用 JDK 内部 API（sun.awt.AWTAccessor、sun.lwawt.LWComponentPeer 等）。
+    //   JDK17 起 java.desktop 不再默认导出这些包，于是在 addNotify（浏览器真正上屏的那一刻）
+    //   抛 IllegalAccessError：
+    //     class org.cef.browser.mac.CefBrowserWindowMac cannot access class sun.awt.AWTAccessor
+    //   表现正是「引擎初始化成功、一打开登录页就白屏/不可用」，异常还会打断 Compose 渲染
+    //   导致整个窗口被销毁、进程直接退出。以下三个包必须显式导出/开放。
+    //   仅在 macOS 生效：Windows 的 java.desktop 里没有 sun.lwawt*，无条件加会打「未知包」告警。
+    if (System.getProperty("os.name", "").lowercase().contains("mac")) {
+        jvmArgs(
+            "--add-exports=java.desktop/sun.awt=ALL-UNNAMED",
+            "--add-opens=java.desktop/sun.awt=ALL-UNNAMED",
+            "--add-exports=java.desktop/sun.lwawt=ALL-UNNAMED",
+            "--add-opens=java.desktop/sun.lwawt=ALL-UNNAMED",
+            "--add-exports=java.desktop/sun.lwawt.macosx=ALL-UNNAMED",
+            "--add-opens=java.desktop/sun.lwawt.macosx=ALL-UNNAMED"
+        )
+    }
 }
 
 // 收集运行时依赖 jar 路径（供便携版 app-image 打包）
@@ -256,6 +326,18 @@ tasks.register<Sync>("exportJcefNatives") {
 compose.desktop {
     application {
         mainClass = "com.yunx.app.MainKt"
+        // ★ 与 :desktop:run 保持一致的 JVM 参数：jpackage 生成的启动器必须显式导出
+        //   java.desktop 的 sun.awt / sun.lwawt，否则 macOS 上 JCEF 画布上屏时 IllegalAccessError
+        if (System.getProperty("os.name", "").lowercase().contains("mac")) {
+            jvmArgs += listOf(
+                "--add-exports=java.desktop/sun.awt=ALL-UNNAMED",
+                "--add-opens=java.desktop/sun.awt=ALL-UNNAMED",
+                "--add-exports=java.desktop/sun.lwawt=ALL-UNNAMED",
+                "--add-opens=java.desktop/sun.lwawt=ALL-UNNAMED",
+                "--add-exports=java.desktop/sun.lwawt.macosx=ALL-UNNAMED",
+                "--add-opens=java.desktop/sun.lwawt.macosx=ALL-UNNAMED"
+            )
+        }
         nativeDistributions {
             targetFormats(TargetFormat.Exe)
             // sqlite-jdbc 通过反射加载 java.sql.Driver，jlink 自动检测不到，必须显式声明；

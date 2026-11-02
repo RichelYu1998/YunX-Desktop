@@ -30,6 +30,22 @@ object JcefHolder {
     private const val TAG = "YunX-JCEF"
     private const val MAX_INIT_ATTEMPTS = 3
 
+    /**
+     * 环境变量 `YUNXPC_SKIP_JCEF=1` 时禁用 CEF。
+     * 用途：CEF 原生库按 Windows 打包（见 desktop/build.gradle.kts 的
+     * `jcef-natives-windows-amd64`），在 macOS / Linux 上首次初始化会从 Maven
+     * 下载上百 MB 且最终不可用。设为 1 可跳过，登录页自动退到粘贴模式。
+     */
+    private val disabled = System.getenv("YUNXPC_SKIP_JCEF") == "1"
+
+    /** 被禁用的原因（未禁用为 null）；登录页据此向用户展示可操作提示，而不是笼统的「不可用」 */
+    val disabledReason: String? = if (disabled) {
+        "内嵌浏览器已被环境变量 YUNXPC_SKIP_JCEF=1 关闭（启动脚本 --no-jcef 或 Linux 默认跳过），" +
+            "去掉该变量重启即可启用"
+    } else {
+        null
+    }
+
     /** 隔离目录前缀：`cache\jcef.crashed-<时间>` */
     private const val QUARANTINE_PREFIX = "jcef.crashed-"
 
@@ -53,6 +69,10 @@ object JcefHolder {
     private var crashRecoveryDone = false
 
     fun initBlocking() {
+        if (disabled) {
+            Log.i(TAG, "JCEF disabled by YUNXPC_SKIP_JCEF=1, fallback to paste mode")
+            return
+        }
         synchronized(lock) {
             if (browserReady) return
             var lastError: Throwable? = null
@@ -64,6 +84,7 @@ object JcefHolder {
                     }
                     killStaleJcefHelpers()
                     recoverFromAbnormalExit()
+                    ensureJawtLoaded()
                     val builder = CefAppBuilder()
                     val installDir = File(AppContext.cacheDir, "jcef-bundle")
                     builder.setInstallDir(installDir)
@@ -106,6 +127,7 @@ object JcefHolder {
      * 完成后 [browserReady] 置为 true，登录页自动切换为内嵌浏览器模式。
      */
     fun initInBackground() {
+        if (disabled) return
         synchronized(lock) {
             if (browserReady) return
             if (initThread?.isAlive == true) return
@@ -119,6 +141,45 @@ object JcefHolder {
     fun app(): CefApp? = cefApp
 
     fun isAvailable(): Boolean = browserReady
+
+    /**
+     * 登录页展示的「为什么不可用」：已禁用 → 环境变量原因；初始化失败 → 异常摘要；就绪 → null。
+     */
+    fun unavailableReason(): String? {
+        disabledReason?.let { return it }
+        if (browserReady) return null
+        val err = initFailure ?: return "内嵌浏览器正在初始化，请稍候…"
+        return "内嵌浏览器初始化失败：${err.message ?: err::class.simpleName}"
+    }
+
+    /**
+     * 显式预载 jawt（AWT 原生库）。
+     *
+     * java-cef 在初始化时会 `System.loadLibrary("jawt")`，而 JDK 的 libjawt 并不在默认
+     * `java.library.path` 里 —— 只有 Gradle 的 `:desktop:run` 通过 build.gradle.kts 的
+     * JavaExec 配置补上了 `<JDK>/lib`。直接用 IDE 运行 / 自行拼 classpath 启动时就会
+     * UnsatisfiedLinkError，表现正是「内嵌浏览器不可用」。
+     * 这里按 java.home 定位并 System.load 绝对路径，让任何启动方式都能起来。
+     */
+    private fun ensureJawtLoaded() {
+        if (runCatching { System.loadLibrary("jawt") }.isSuccess) return
+        val home = File(System.getProperty("java.home"))
+        val candidates = listOf(
+            File(home, "lib/libjawt.dylib"),
+            File(home, "lib/libjawt.so"),
+            File(home, "bin/jawt.dll"),
+            File(home, "jre/lib/libjawt.dylib"),
+            File(home, "jre/bin/jawt.dll")
+        )
+        val file = candidates.firstOrNull { it.isFile }
+        if (file == null) {
+            Log.w(TAG, "未找到 jawt 原生库（java.home=$home），交给 CEF 自行加载")
+            return
+        }
+        runCatching { System.load(file.absolutePath) }
+            .onSuccess { Log.i(TAG, "jawt preloaded: ${file.absolutePath}") }
+            .onFailure { Log.w(TAG, "jawt preload failed: ${it.message}") }
+    }
 
     /**
      * 清理上次异常退出残留的 CEF 子进程：它们持有缓存目录/配置锁，

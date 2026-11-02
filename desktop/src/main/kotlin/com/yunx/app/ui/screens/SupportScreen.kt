@@ -303,7 +303,7 @@ fun SupportScreen(
             // ---------- PC 版仓库入口 ----------
             OutlinedButton(
                 onClick = {
-                    DesktopActions.openUrl("https://github.com/tidain/YunX-Desktop")
+                    DesktopActions.openUrl("https://github.com/RichelYu1998/YunX-Desktop")
                     SnackbarController.show("已打开 PC 版仓库")
                 },
                 modifier = Modifier

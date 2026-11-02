@@ -19,7 +19,7 @@
 ## 命令
 
 ```powershell
-git clone https://github.com/tidain/YunX-Desktop.git
+git clone https://github.com/RichelYu1998/YunX-Desktop.git
 cd YunX-Desktop
 
 .\run.ps1 run        # 编译并启动（开发，含 darkmode.dll）

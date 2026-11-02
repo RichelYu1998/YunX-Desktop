@@ -2,6 +2,7 @@ package com.yunx.app.data.network
 
 import com.yunx.app.data.network.model.QuotaInfo
 import com.yunx.app.data.network.model.ShareFile
+import com.yunx.app.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
@@ -39,10 +40,21 @@ data class BaiduTransferResult(
 class BaiduApi(
     private val clientProvider: () -> OkHttpClient = { HttpClients.apiClient() }
 ) {
+    private companion object {
+        const val TAG = "YunX-BaiduApi"
+    }
+
     /** 每次请求动态获取全局客户端（忽略 SSL 开关切换即时生效） */
     private val client get() = clientProvider()
 
     private val formMediaType = "application/x-www-form-urlencoded".toMediaType()
+
+    /**
+     * 所有请求统一补齐 Cookie（见 [BaiduConstants.normalizeCookie]）。
+     * 老版本保存的 Cookie 可能缺 `PANWEB`，缺它时网盘接口一律当未登录（errno=-6），
+     * 在这里兜底补齐，用户无需重新登录。
+     */
+    private fun ck(cookie: String): String = BaiduConstants.normalizeCookie(cookie)
 
     /** bdstoken 缓存（登录态内长期有效） */
     @Volatile
@@ -59,8 +71,7 @@ class BaiduApi(
     /** 获取 bdstoken（gettemplatevariable，带缓存） */
     suspend fun getBdstoken(cookie: String): String? = withContext(Dispatchers.IO) {
         cachedBdstoken?.takeIf { it.isNotBlank() }?.let { return@withContext it }
-        val result = templateVariable(cookie, """["bdstoken"]""") ?: return@withContext null
-        val token = result.optString("bdstoken").takeIf { it.isNotBlank() } ?: return@withContext null
+        val token = fetchBdstoken(cookie) ?: return@withContext null
         cachedBdstoken = token
         token
     }
@@ -71,10 +82,49 @@ class BaiduApi(
      */
     suspend fun refreshBdstoken(cookie: String): String? = withContext(Dispatchers.IO) {
         cachedBdstoken = null
-        val result = templateVariable(cookie, """["bdstoken"]""") ?: return@withContext null
-        val token = result.optString("bdstoken").takeIf { it.isNotBlank() } ?: return@withContext null
+        val token = fetchBdstoken(cookie) ?: return@withContext null
         cachedBdstoken = token
         token
+    }
+
+    /**
+     * 真正去拉 bdstoken：先走 gettemplatevariable，失败再回退解析网盘首页 HTML。
+     *
+     * 为什么要回退：gettemplatevariable 在部分账号/风控状态下会返回 errno=0 但
+     * result 里没有 bdstoken（昵称却能正常返回），此时表现为「获取 bdstoken 失败，
+     * 请重新登录」——其实登录态是好的。网盘首页 HTML 的 yunData 里一定带着 bdstoken。
+     */
+    private suspend fun fetchBdstoken(cookie: String): String? = withContext(Dispatchers.IO) {
+        val fromTemplate = templateVariable(cookie, """["bdstoken"]""")
+            ?.optString("bdstoken")
+            ?.takeIf { it.isNotBlank() }
+        if (fromTemplate != null) return@withContext fromTemplate
+        Log.d(TAG, "gettemplatevariable 未返回 bdstoken，回退解析网盘首页")
+        bdstokenFromHomePage(cookie)
+    }
+
+    /**
+     * 从 https://pan.baidu.com/disk/home 的 HTML 里提取 bdstoken。
+     * 页面把 `"bdstoken":"xxxx"` 放在 yunData / 内联脚本里，正则取第一个非空值即可。
+     */
+    private suspend fun bdstokenFromHomePage(cookie: String): String? = withContext(Dispatchers.IO) {
+        runCatching {
+            val request = Request.Builder()
+                .url("https://pan.baidu.com/disk/home")
+                .header("Cookie", ck(cookie))
+                .header("User-Agent", BaiduConstants.UA_WEB)
+                .get()
+                .build()
+            client.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) return@use null
+                val html = response.body?.string() ?: return@use null
+                Regex("\"bdstoken\"\\s*:\\s*\"([^\"]*)\"")
+                    .find(html)
+                    ?.groupValues
+                    ?.get(1)
+                    ?.takeIf { it.isNotBlank() && it != "null" }
+            }
+        }.getOrNull()
     }
 
     /** 清空 bdstoken 缓存（登出/切换账号时调用，避免旧 token 跨账号复用导致 errno=-6） */
@@ -89,15 +139,24 @@ class BaiduApi(
                 URLEncoder.encode(fields, "UTF-8")
             val request = Request.Builder()
                 .url(url)
-                .header("Cookie", cookie)
+                .header("Cookie", ck(cookie))
                 .header("User-Agent", BaiduConstants.UA_WEB)
                 .get()
                 .build()
             runCatching {
                 client.newCall(request).execute().use { response ->
-                    if (!response.isSuccessful) return@use null
-                    val json = JSONObject(response.body?.string() ?: "{}")
-                    if (json.optInt("errno") != 0) return@use null
+                    if (!response.isSuccessful) {
+                        Log.w(TAG, "gettemplatevariable HTTP ${response.code}")
+                        return@use null
+                    }
+                    val body = response.body?.string() ?: "{}"
+                    val json = JSONObject(body)
+                    val errno = json.optInt("errno")
+                    if (errno != 0) {
+                        // errno=-6 表示服务端认为未登录：Cookie 头里缺少关键项或已过期
+                        Log.w(TAG, "gettemplatevariable fields=$fields errno=$errno")
+                        return@use null
+                    }
                     json.optJSONObject("result")
                 }
             }.getOrNull()
@@ -114,7 +173,7 @@ class BaiduApi(
             val body = "pwd=${urlEncode(pwd)}&vcode_str=&vcode="
             val request = Request.Builder()
                 .url("https://pan.baidu.com/share/verify?surl=$surl")
-                .header("Cookie", cookie)
+                .header("Cookie", ck(cookie))
                 .header("User-Agent", BaiduConstants.UA_WEB)
                 .header("Referer", "https://pan.baidu.com/s/$surl")
                 .header("Content-Type", "application/x-www-form-urlencoded")
@@ -150,7 +209,7 @@ suspend fun listShare(surl: String, sekey: String, dir: String, cookie: String, 
             "$cookie; BDCLND=$sekey" else cookie
         val request = Request.Builder()
             .url(url)
-            .header("Cookie", authCookie)
+            .header("Cookie", ck(authCookie))
             .header("User-Agent", BaiduConstants.UA_WEB)
             .header("Referer", "https://pan.baidu.com/s/$surl")
             .get()
@@ -208,7 +267,7 @@ suspend fun listShare(surl: String, sekey: String, dir: String, cookie: String, 
         val request = Request.Builder()
             .url("https://pan.baidu.com/api/create?a=commit&channel=chunlei&web=1" +
                 "&app_id=${BaiduConstants.APP_ID}&clienttype=0&bdstoken=$bdstoken")
-            .header("Cookie", cookie)
+            .header("Cookie", ck(cookie))
             .header("User-Agent", BaiduConstants.UA_WEB)
             .header("Referer", "https://pan.baidu.com/disk/main")
             .header("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
@@ -226,7 +285,7 @@ suspend fun listShare(surl: String, sekey: String, dir: String, cookie: String, 
             "&web=1&order=time&desc=1&dir=" + URLEncoder.encode(dir, "UTF-8") + "&num=100&page=1"
         val request = Request.Builder()
             .url(url)
-            .header("Cookie", cookie)
+            .header("Cookie", ck(cookie))
             .header("User-Agent", BaiduConstants.UA_WEB)
             .get()
             .build()
@@ -265,7 +324,7 @@ suspend fun listShare(surl: String, sekey: String, dir: String, cookie: String, 
         val authCookie = if (cookie.contains("BDCLND=")) cookie else "$cookie; BDCLND=$sekey"
         val request = Request.Builder()
             .url(url)
-            .header("Cookie", authCookie)
+            .header("Cookie", ck(authCookie))
             .header("User-Agent", BaiduConstants.UA_WEB)
             .header("Origin", "https://pan.baidu.com")
             .header("Referer", "https://pan.baidu.com/s/")
@@ -315,7 +374,7 @@ suspend fun listShare(surl: String, sekey: String, dir: String, cookie: String, 
             "&version=2.2.111.34&version_app=12.24.6&vip=0"
         val request = Request.Builder()
             .url(url)
-            .header("Cookie", cookie)
+            .header("Cookie", ck(cookie))
             .header("User-Agent", BaiduConstants.UA_NETDISK)
             .header("Content-Type", "application/x-www-form-urlencoded")
             .post("0".toRequestBody(formMediaType))
@@ -352,7 +411,7 @@ suspend fun listShare(surl: String, sekey: String, dir: String, cookie: String, 
             "&clienttype=0&app_id=${BaiduConstants.APP_ID}&web=1"
         val request = Request.Builder()
             .url(url)
-            .header("Cookie", cookie)
+            .header("Cookie", ck(cookie))
             .header("User-Agent", BaiduConstants.UA_WEB)
             .get()
             .build()
@@ -371,7 +430,7 @@ suspend fun listShare(surl: String, sekey: String, dir: String, cookie: String, 
         val request = Request.Builder()
             .url("https://pan.baidu.com/api/filemanager?async=2&onnest=fail&opera=delete" +
                 "&bdstoken=$bdstoken&newVerify=1&clienttype=0&app_id=${BaiduConstants.APP_ID}&web=1")
-            .header("Cookie", cookie)
+            .header("Cookie", ck(cookie))
             .header("User-Agent", BaiduConstants.UA_WEB)
             .header("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
             .post(body.toRequestBody(formMediaType))
@@ -403,6 +462,12 @@ suspend fun listShare(surl: String, sekey: String, dir: String, cookie: String, 
             errno = errno2
         }
         if (errno != 0) {
+            // errno=-6：服务端认为未登录。常见两种：Cookie 已过期，或 bdstoken 为空/无效。
+            // 日志里把 bdstoken 是否拿到一并打出，便于区分是「凭证过期」还是「token 拉取失败」。
+            Log.w(
+                TAG,
+                "api/list dir=$dir errno=$errno bdstoken=${if (bdstoken.isNullOrBlank()) "空" else "有"}"
+            )
             throw IllegalStateException("百度网盘接口错误 (errno=$errno)")
         }
         buildList {
@@ -438,7 +503,7 @@ suspend fun listShare(surl: String, sekey: String, dir: String, cookie: String, 
             URLEncoder.encode(dir, "UTF-8") + "&num=100&page=1" + bdstokenPart
         val request = Request.Builder()
             .url(url)
-            .header("Cookie", cookie)
+            .header("Cookie", ck(cookie))
             .header("User-Agent", BaiduConstants.UA_WEB)
             .header("Accept", "*/*")
             .header("Accept-Language", "zh-CN,zh;q=0.9")
@@ -458,7 +523,7 @@ suspend fun listShare(surl: String, sekey: String, dir: String, cookie: String, 
         val request = Request.Builder()
             .url("https://pan.baidu.com/api/filemanager?async=0&onnest=fail&opera=rename" +
                 "&bdstoken=$bdstoken&clienttype=0&app_id=${BaiduConstants.APP_ID}&web=1")
-            .header("Cookie", cookie)
+            .header("Cookie", ck(cookie))
             .header("User-Agent", BaiduConstants.UA_WEB)
             .header("Content-Type", "application/x-www-form-urlencoded")
             .header("Referer", "https://pan.baidu.com/disk/main")
@@ -485,7 +550,7 @@ suspend fun listShare(surl: String, sekey: String, dir: String, cookie: String, 
         val request = Request.Builder()
             .url("https://pan.baidu.com/api/filemanager?async=2&onnest=fail&opera=move" +
                 "&bdstoken=$bdstoken&clienttype=0&app_id=${BaiduConstants.APP_ID}&web=1")
-            .header("Cookie", cookie)
+            .header("Cookie", ck(cookie))
             .header("User-Agent", BaiduConstants.UA_WEB)
             .header("Content-Type", "application/x-www-form-urlencoded")
             .header("Referer", "https://pan.baidu.com/disk/main")
@@ -504,7 +569,7 @@ suspend fun listShare(surl: String, sekey: String, dir: String, cookie: String, 
         val request = Request.Builder()
             .url("https://pan.baidu.com/api/filemanager?async=2&onnest=fail&opera=delete" +
                 "&bdstoken=$bdstoken&newVerify=1&clienttype=0&app_id=${BaiduConstants.APP_ID}&web=1")
-            .header("Cookie", cookie)
+            .header("Cookie", ck(cookie))
             .header("User-Agent", BaiduConstants.UA_WEB)
             .header("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
             .header("Referer", "https://pan.baidu.com/disk/main")
@@ -548,7 +613,7 @@ suspend fun listShare(surl: String, sekey: String, dir: String, cookie: String, 
         val request = Request.Builder()
             .url("https://pan.baidu.com/share/set?channel=chunlei&web=1" +
                 "&app_id=${BaiduConstants.APP_ID}&bdstoken=$bdstoken&clienttype=0")
-            .header("Cookie", cookie)
+            .header("Cookie", ck(cookie))
             .header("User-Agent", BaiduConstants.UA_WEB)
             .header("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
             .header("Referer", "https://pan.baidu.com/disk/main")
@@ -577,7 +642,7 @@ suspend fun listShare(surl: String, sekey: String, dir: String, cookie: String, 
         runCatching {
             val request = Request.Builder()
                 .url(url)
-                .header("Cookie", cookie)
+                .header("Cookie", ck(cookie))
                 .header("User-Agent", BaiduConstants.UA_WEB)
                 .header("X-Requested-With", "XMLHttpRequest")
                 .header("Referer", "https://pan.baidu.com/disk/main")

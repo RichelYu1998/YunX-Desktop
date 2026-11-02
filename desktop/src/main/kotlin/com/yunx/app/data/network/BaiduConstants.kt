@@ -28,4 +28,19 @@ object BaiduConstants {
     /** 关键 Cookie 字段，缺失 BDUSS 则视为未登录 */
     fun isValidCookie(cookie: String?): Boolean =
         cookie != null && cookie.contains("BDUSS=")
+
+    /**
+     * 补齐网盘网页版必备但可能采集不到的 Cookie。
+     *
+     * `PANWEB=1` 由 pan.baidu.com 下发，domain 是 `pan.baidu.com`（不是 `.baidu.com`）。
+     * 采集端若按域名过滤不当会漏掉它，而百度网盘接口在缺少 PANWEB 时一律按未登录处理：
+     * 列目录返回 errno=-6、gettemplatevariable 不回 bdstoken。这里做一次兜底补齐，
+     * 让老版本保存下来的 Cookie 也能正常使用（无需用户重新登录）。
+     */
+    fun normalizeCookie(cookie: String): String {
+        val trimmed = cookie.trim().trimEnd(';')
+        if (trimmed.isEmpty()) return trimmed
+        return if (Regex("(?i)(^|;\\s*)PANWEB=").containsMatchIn(trimmed)) trimmed
+        else "$trimmed; PANWEB=1"
+    }
 }

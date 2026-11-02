@@ -34,6 +34,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -43,6 +44,7 @@ import androidx.compose.ui.unit.dp
 import com.yunx.app.ui.SnackbarController
 import com.yunx.app.util.BrowserCookieImporter
 import com.yunx.app.util.Log
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -58,11 +60,19 @@ import javax.swing.JPanel
 
 private const val TAG = "YunX-JCEF-UI"
 
+/** 登录态轮询间隔 */
+private const val POLL_INTERVAL_MS = 1_500L
+
+/** 同一份 Cookie 校验失败后，间隔多久才允许自动重试（网络闪断恢复后能自动补登） */
+private const val AUTO_RETRY_MS = 10_000L
+
 /**
  * 内嵌浏览器登录面板（方案 B）：
- * - SwingPanel 嵌入真实 Chromium（JCEF），加载网盘登录页；
- * - 每 1.5 秒轮询全局 Cookie，检测到必需键后提示「已检测到登录态」，一键保存；
- * - 底部提供「自动导入浏览器 Cookie」（方案 A）与「手动粘贴」备选。
+ * - SwingPanel 嵌入真实 Chromium（JCEF），加载网盘登录页，扫码 / 账号密码 / 短信验证等
+ *   多方式登录都由官网页面自己完成；
+ * - 每 [POLL_INTERVAL_MS] 轮询全局 Cookie，检测到必需键即**自动保存登录态**并返回，
+ *   解析 / 下载随后自动携带这份 Cookie（token），无需手动点击；
+ * - 底部保留「自动导入浏览器 Cookie」（方案 A）与「手动粘贴」两个兜底入口。
  *
  * @param requiredKeys 必须全部出现的 Cookie 键名（与键名集合取交集，全命中才算登录态）
  * @param anyOfKeys 候选键名（任一出现即视为登录态）；用于网页版仅下发 authorization、
@@ -81,13 +91,54 @@ fun JcefLoginPane(
     anyOfKeys: List<String> = emptyList()
 ) {
     val scope = rememberCoroutineScope()
-    val app = JcefHolder.app()
+    // ★ 必须观察 browserReady 而不是一次性取 app()：macOS 在窗口出现前同步初始化，
+    //   但 Windows/Linux 是后台初始化，登录页可能先于 CEF 就绪被打开。此前用快照导致
+    //   app==null 时永远停在「初始化中 / 不可用」，CEF 就绪后也不会重建浏览器。
+    val ready = JcefHolder.browserReady
+    val app = if (ready) JcefHolder.app() else null
     var detectedCookie by remember { mutableStateOf<String?>(null) }
     var isSaving by remember { mutableStateOf(false) }
+    var saveError by remember { mutableStateOf<String?>(null) }
+    var savedOnce by remember { mutableStateOf(false) }
     var browserFailure by remember { mutableStateOf<String?>(null) }
+    // 回调可能在重组间变化，协程里始终取最新实现
+    val currentOnSave by rememberUpdatedState(onSave)
+    val currentOnSaved by rememberUpdatedState(onSaved)
+
+    // 未就绪时再触发一次后台初始化；成功后 ready 翻转 → 下面的 remember(ready) 重建浏览器
+    LaunchedEffect(Unit) { JcefHolder.initInBackground() }
+
+    /** 保存登录态：成功即落库并关闭登录页；失败记录原因，由轮询冷却后自动重试 */
+    val saveCookie: suspend (String) -> Boolean = { cookie ->
+        isSaving = true
+        saveError = null
+        var failure: Exception? = null
+        val ok = try {
+            currentOnSave(cookie)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.e(TAG, "save login cookie failed", e)
+            failure = e
+            false
+        } finally {
+            isSaving = false
+        }
+        if (ok) {
+            savedOnce = true
+            SnackbarController.show("登录成功")
+            currentOnSaved()
+        } else {
+            // 区分「保存失败」与「凭证无效」：保存失败（如密钥/数据库异常）会一直失败，
+            // 提示成「登录态已过期」会让用户误以为要重新登录
+            saveError = failure?.let { "保存登录凭据失败：${it.message ?: it::class.simpleName}" }
+                ?: "登录态无效（Cookie 里缺少必要字段），稍后自动重试"
+        }
+        ok
+    }
 
     // 创建浏览器（Compose 桌面 UI 线程即 EDT，JCEF 要求在 EDT 上创建）
-    val browserHolder = remember {
+    val browserHolder = remember(ready) {
         if (app == null) {
             null
         } else {
@@ -98,6 +149,7 @@ fun JcefLoginPane(
                 // 强行创建原生浏览器窗口，首次绘制丢失 → 白屏直到手动缩放窗口。
                 // 交给 java-cef 在画布 addNotify（拿到真实尺寸）时自动创建，
                 // 登录页一显示画布即挂载，页面加载与 Cookie 检测仅延迟几毫秒。
+                Log.i(TAG, "内嵌浏览器已创建：$loginUrl")
                 BrowserHolder(client, browser)
             } catch (t: Throwable) {
                 browserFailure = "内嵌浏览器启动失败：${t.message}"
@@ -116,14 +168,26 @@ fun JcefLoginPane(
 
     BackHandler(enabled = !isSaving) { onBack() }
 
-    // 轮询 Cookie：检测必需键齐全后置为 detectedCookie
-    // （visitAllCookies 回调在 CEF IO 线程异步执行，需等待其完成再判断，见 collectCookies）
+    // 轮询 Cookie：检测到登录态后**自动保存**，无需手动点按钮。
+    // 与参考实现（Playwright 轮询 context.cookies、命中 token 即落盘）同一思路：
+    // 页面登录成功那一刻就把 Cookie 写进账号库，解析 / 下载立即自动带上 token；
+    // 校验失败（旧会话 / 网络抖动）时按 [AUTO_RETRY_MS] 冷却后自动重试。
     LaunchedEffect(browserHolder) {
         if (browserHolder == null) return@LaunchedEffect
+        var lastAttemptCookie: String? = null
+        var lastAttemptTs = 0L
         while (true) {
             val cookie = withContext(Dispatchers.IO) { collectCookies(domains, requiredKeys, anyOfKeys) }
-            if (cookie != null) detectedCookie = cookie
-            delay(1500)
+            if (cookie != null && !savedOnce) {
+                detectedCookie = cookie
+                val now = System.currentTimeMillis()
+                if (cookie != lastAttemptCookie || now - lastAttemptTs >= AUTO_RETRY_MS) {
+                    lastAttemptCookie = cookie
+                    lastAttemptTs = now
+                    if (saveCookie(cookie)) return@LaunchedEffect
+                }
+            }
+            delay(POLL_INTERVAL_MS)
         }
     }
 
@@ -159,7 +223,7 @@ fun JcefLoginPane(
             }
         }
 
-        // 状态卡
+        // 状态卡：登录态检测 → 自动保存全过程的状态反馈
         Surface(
             color = if (detectedCookie != null) {
                 MaterialTheme.colorScheme.primaryContainer
@@ -176,39 +240,41 @@ fun JcefLoginPane(
                 horizontalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 if (detectedCookie != null) {
-                    Icon(
-                        Icons.Outlined.CheckCircle,
-                        contentDescription = null,
-                        tint = MaterialTheme.colorScheme.primary
-                    )
-                    Text(
-                        text = "已检测到登录态",
-                        style = MaterialTheme.typography.titleSmall,
-                        color = MaterialTheme.colorScheme.onPrimaryContainer,
-                        modifier = Modifier.weight(1f)
-                    )
-                    Button(
-                        onClick = {
-                            val cookie = detectedCookie ?: return@Button
-                            scope.launch {
-                                isSaving = true
-                                val ok = onSave(cookie)
-                                isSaving = false
-                                if (ok) {
-                                    SnackbarController.show("登录成功")
-                                    onSaved()
-                                } else {
-                                    SnackbarController.show("Cookie 校验失败，请确认已登录")
-                                }
-                            }
-                        },
-                        enabled = !isSaving
-                    ) {
-                        if (isSaving) {
-                            CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
-                        } else {
-                            Text("保存登录")
+                    if (isSaving) {
+                        CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                    } else {
+                        Icon(
+                            Icons.Outlined.CheckCircle,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.primary
+                        )
+                    }
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = when {
+                                isSaving -> "已检测到登录态，正在自动保存…"
+                                saveError != null -> "已检测到登录态"
+                                else -> "已检测到登录态，正在自动保存…"
+                            },
+                            style = MaterialTheme.typography.titleSmall,
+                            color = MaterialTheme.colorScheme.onPrimaryContainer
+                        )
+                        saveError?.let { err ->
+                            Text(
+                                text = err,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.error
+                            )
                         }
+                    }
+                    // 自动保存失败时的兜底：立即重试一次，不必等冷却
+                    if (saveError != null && !isSaving) {
+                        Button(
+                            onClick = {
+                                val cookie = detectedCookie ?: return@Button
+                                scope.launch { saveCookie(cookie) }
+                            }
+                        ) { Text("立即保存") }
                     }
                 } else {
                     Icon(
@@ -217,7 +283,7 @@ fun JcefLoginPane(
                         tint = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                     Text(
-                        text = browserFailure ?: "请在下方网页中登录，登录成功后自动检测",
+                        text = browserFailure ?: "请在下方网页中登录（扫码 / 账号密码 / 短信均可），登录成功后自动保存",
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.weight(1f)
@@ -263,10 +329,28 @@ fun JcefLoginPane(
                     modifier = Modifier.fillMaxSize().padding(24.dp),
                     contentAlignment = Alignment.Center
                 ) {
-                    Text(
-                        text = browserFailure ?: "内嵌浏览器不可用",
-                        style = MaterialTheme.typography.bodyLarge
-                    )
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        if (!ready && JcefHolder.disabledReason == null) {
+                            CircularProgressIndicator(modifier = Modifier.size(22.dp), strokeWidth = 2.dp)
+                        }
+                        Text(
+                            text = browserFailure ?: JcefHolder.unavailableReason()
+                                ?: "内嵌浏览器不可用",
+                            style = MaterialTheme.typography.bodyLarge,
+                            textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                        )
+                        // 未禁用时给出重试入口：初始化失败多半是残留 CEF 子进程占着缓存目录，
+                        // 重试会先清理残留再重新初始化
+                        if (JcefHolder.disabledReason == null) {
+                            OutlinedButton(onClick = {
+                                browserFailure = null
+                                JcefHolder.initInBackground()
+                            }) { Text("重试加载内嵌浏览器") }
+                        }
+                    }
                 }
             }
         }
@@ -316,12 +400,12 @@ private fun collectCookies(
 ): String? {
     return runCatching {
         val manager = CefCookieManager.getGlobalManager()
-        val pairs = java.util.concurrent.ConcurrentLinkedQueue<Pair<String, String>>()
+        val pairs = java.util.concurrent.ConcurrentLinkedQueue<Triple<String, String, String>>()
         manager.visitAllCookies(object : CefCookieVisitor {
             override fun visit(cookie: CefCookie, count: Int, total: Int, delete: BoolRef): Boolean {
                 val domain = cookie.domain ?: ""
-                if (domains.any { domain.contains(it) }) {
-                    pairs.add((cookie.name ?: "") to (cookie.value ?: ""))
+                if (domains.any { domainMatches(domain, it) }) {
+                    pairs.add(Triple(cookie.name ?: "", cookie.value ?: "", domain))
                 }
                 return true
             }
@@ -329,16 +413,42 @@ private fun collectCookies(
         // 等待 IO 线程回调完成（CEF 遍历 Cookie 库很快，几百毫秒足够）
         Thread.sleep(400)
         val all = pairs.toList()
+        // ★ 过滤空名/空值：浏览器偶尔会写入无名 Cookie，拼进 Cookie 头会变成 ";; =v"，
+        //   服务端解析失败 → 直接判定未登录（百度表现就是 errno=-6）
+        val valid = all.filter { it.first.isNotBlank() && it.second.isNotBlank() }
         if (all.isNotEmpty()) {
-            Log.d(TAG, "cookies for $domains: ${all.size} (keys=${all.map { it.first }.distinct()})")
+            Log.d(
+                TAG,
+                "cookies for $domains: ${all.size}->${valid.size} " +
+                    "(keys=${valid.map { it.first }.distinct()})"
+            )
         }
-        val names = all.map { it.first }.toSet()
+        // ★ 同名 Cookie 去重：按 RFC 6265，域越具体优先级越高。visitAllCookies 顺序不保证，
+        //   所以按 domain 长度升序写入，最后写进去的就是最具体那个域的值。
+        val merged = LinkedHashMap<String, String>()
+        valid.sortedBy { it.third.length }.forEach { (name, value, _) -> merged[name] = value }
+        val names = merged.keys
         // 必需键全命中 OR anyOfKeys 任一命中；anyOfKeys 为空时仅看 requiredKeys
         val requiredOk = requiredKeys.all { names.contains(it) }
         val anyOk = anyOfKeys.isNotEmpty() && anyOfKeys.any { names.contains(it) }
         if (!requiredOk && !anyOk) return null
-        all.joinToString("; ") { "${it.first}=${it.second}" }
+        merged.entries.joinToString("; ") { "${it.key}=${it.value}" }
     }.getOrNull()
+}
+
+/**
+ * Cookie 域是否属于目标域。
+ *
+ * ★ 必须按「域后缀」比较，不能按子串：此前用 `domain.contains(".baidu.com")`，
+ *   于是 `pan.baidu.com` / `.pan.baidu.com` 这类**网盘自己域**的 Cookie 全部被漏掉，
+ *   其中就有网盘网页版必备的 `PANWEB=1`。缺少它时百度网盘接口一律按未登录处理
+ *   （列目录 errno=-6、gettemplatevariable 不回 bdstoken），表现正是「获取 bdstoken 失败」。
+ */
+private fun domainMatches(cookieDomain: String, target: String): Boolean {
+    val d = cookieDomain.trim().lowercase().trimStart('.')
+    val t = target.trim().lowercase().trimStart('.')
+    if (d.isEmpty() || t.isEmpty()) return false
+    return d == t || d.endsWith(".$t")
 }
 
 /**

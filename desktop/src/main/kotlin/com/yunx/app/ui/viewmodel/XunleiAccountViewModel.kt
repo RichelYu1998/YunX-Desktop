@@ -110,27 +110,22 @@ class XunleiAccountViewModel(
             }
             try {
                 if (step.needSms) {
-                    // 触发安全验证：优先用 reviewurl 里的 creditkey（风控响应自带），否则走自有 sendSms
+                    // 触发安全验证：reviewurl 里的 creditkey/token 就是这次验证的上下文。
+                    // ★ 有上下文时不要「另起一个 sendsms」：验证码绑定在 review 上下文上，
+                    //   另起上下文会让随后提交的验证码被判「验证码校验失败」。
                     val reviewMap = XunleiApi.parseReviewUrl(step.reviewUrl)
                     val creditKey = reviewMap["creditkey"].orEmpty()
-                    if (creditKey.isNotBlank()) {
-                        // 直接用响应里的 creditkey/token 进入短信输入步骤（token 可能为空，sendSms 会补）；
-                        // 进入界面不会自动发送验证码，smsSent 保持 false，UI 显示「发送验证码」
-                        loginStep = step.copy(
-                            smsCreditKey = creditKey,
-                            smsToken = reviewMap["token"].orEmpty()
-                        )
+                    val reviewToken = reviewMap["token"].orEmpty()
+                    val smsStep = repository.sendSms(username.trim(), creditKey, reviewToken)
+                    if (smsStep.smsCreditKey.isNotBlank()) {
+                        smsSent = true
+                        smsCooldownUntil = System.currentTimeMillis() + SMS_RESEND_COOLDOWN_MS
+                        // 保留 reviewurl：短信收不到时还能走「应用内验证」
+                        loginStep = smsStep.copy(reviewUrl = step.reviewUrl)
                     } else {
-                        val smsStep = repository.sendSms(username.trim())
-                        if (smsStep.smsCreditKey.isNotBlank()) {
-                            smsSent = true
-                            smsCooldownUntil = System.currentTimeMillis() + SMS_RESEND_COOLDOWN_MS
-                            loginStep = smsStep
-                        } else {
-                            // 不再丢外部链接：给明确失败提示 + 让用户重试
-                            loginError = smsStep.message.ifBlank { "短信发送失败，请重试或检查网络" }
-                            loginStep = step.copy(message = "短信发送失败")
-                        }
+                        // 不再丢外部链接：给明确失败提示 + 让用户重试
+                        loginError = smsStep.message.ifBlank { "短信发送失败，请重试或检查网络" }
+                        loginStep = step.copy(message = "短信发送失败")
                     }
                 } else if (step.sessionKey.isNotBlank() && step.sessionId.isNotBlank()) {
                     val ok = repository.finishLogin(step, username.trim(), newAccount = addNewAccount)
@@ -166,13 +161,20 @@ class XunleiAccountViewModel(
             loginError = null
             sendingSms = true
             try {
-                val step = repository.sendSms(mobile.trim())
+                // 复用当前验证上下文（review_panel 给的 creditkey/token）：重新起上下文会让
+                // 用户收到的验证码在提交时对不上，表现就是「验证码校验失败」
+                val step = repository.sendSms(
+                    mobile.trim(),
+                    loginStep?.smsCreditKey.orEmpty(),
+                    loginStep?.smsToken.orEmpty()
+                )
                 if (step.smsCreditKey.isNotBlank()) {
                     smsSent = true
                     // 冷却从「服务端确认发出」开始算，失败则允许立刻重试
                     smsCooldownUntil = System.currentTimeMillis() + SMS_RESEND_COOLDOWN_MS
                 }
-                loginStep = step
+                // 保留已有的 reviewUrl，避免重发一次就把「应用内验证」入口弄丢
+                loginStep = step.copy(reviewUrl = loginStep?.reviewUrl.orEmpty())
                 if (step.smsCreditKey.isBlank()) loginError = step.message
             } catch (e: CancellationException) {
                 throw e
@@ -189,7 +191,7 @@ class XunleiAccountViewModel(
     fun loginWithSms(mobile: String, code: String, creditKey: String, smsToken: String) {
         viewModelScope.launch {
             loginError = null
-            val ok = try {
+            val result = try {
                 repository.loginWithSms(
                     mobile.trim(),
                     code.trim(),
@@ -203,11 +205,21 @@ class XunleiAccountViewModel(
                 loginError = "登录失败，请检查网络后重试"
                 return@launch
             }
-            if (ok) {
+            if (result.saved) {
                 addNewAccount = false
                 loginSucceeded++
             } else {
-                loginError = "验证码校验失败"
+                // 展示服务端真实原因（验证码错误 / 上下文过期 / 换 token 失败），
+                // 而不是一律「验证码校验失败」
+                loginError = result.message.ifBlank { "验证码校验失败，请确认验证码未过期后重试" }
+                // 失败时保留验证上下文：用户可以改码直接重试，不必再等一次短信；
+                // 服务端给了 reviewurl 时把「应用内验证」兜底入口一并恢复
+                loginStep = (loginStep ?: XunleiLoginStep(needSms = true)).copy(
+                    needSms = true,
+                    smsCreditKey = creditKey,
+                    smsToken = smsToken,
+                    reviewUrl = result.reviewUrl.ifBlank { loginStep?.reviewUrl.orEmpty() }
+                )
             }
         }
     }
